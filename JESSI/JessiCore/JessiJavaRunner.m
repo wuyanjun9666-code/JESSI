@@ -8,11 +8,13 @@
 // Baconium Enterprises ToS: https://baconium.dev/tos
 
 #import <Foundation/Foundation.h>
+#import <dispatch/dispatch.h>
 #import "JessiPaths.h"
 #import <dlfcn.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <stdint.h>
+#import <stdarg.h>
 #import <string.h>
 #import <unistd.h>
 #import <signal.h>
@@ -1309,6 +1311,165 @@ static BOOL jessi_args_contain_prefix(NSArray<NSString *> *args, NSString *prefi
     return NO;
 }
 
+#pragma mark - JESSI GC mode (v1)
+
+// Supported GC selectors that a user may pass through custom launch arguments.
+// Only one of these may end up in the final JVM argv.
+static NSArray<NSString *> *jessi_gc_selector_list(void) {
+    static NSArray<NSString *> *list = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        list = @[
+            @"-XX:+UseSerialGC",
+            @"-XX:+UseG1GC",
+            @"-XX:+UseParallelGC",
+            @"-XX:+UseZGC",
+            @"-XX:+UseShenandoahGC",
+            @"-XX:+UseEpsilonGC",
+            @"-XX:+UseConcMarkSweepGC"
+        ];
+    });
+    return list;
+}
+
+static BOOL jessi_arg_is_gc_selector(NSString *arg) {
+    return arg.length > 0 && [jessi_gc_selector_list() containsObject:arg];
+}
+
+static void jessi_jvm_launch_log(NSString *workDir, NSString *format, ...);
+
+// Resolution order:
+// 1. NSUserDefaults key "jessi.gcMode" (future UI / structured settings)
+// 2. <server working dir>/jessi-gc-mode.txt  (v1 config, easy to drop in via Files)
+// 3. "auto"
+static NSString *jessi_gc_mode_for_workdir(NSString *workDir) {
+    NSString *mode = nil;
+    @try {
+        mode = [[NSUserDefaults standardUserDefaults] stringForKey:@"jessi.gcMode"];
+    } @catch (__unused NSException *e) {
+    }
+
+    if (mode.length == 0 && workDir.length > 0) {
+        NSString *path = [workDir stringByAppendingPathComponent:@"jessi-gc-mode.txt"];
+        mode = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    }
+
+    mode = [[(mode ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    if ([mode isEqualToString:@"auto"] || [mode isEqualToString:@"serial"] || [mode isEqualToString:@"g1"]) {
+        return mode;
+    }
+    if (mode.length > 0) {
+        jessi_jvm_launch_log(workDir, @"Unknown GC mode '%@', falling back to Auto", mode);
+    }
+    return @"auto";
+}
+
+static void jessi_jvm_launch_log(NSString *workDir, NSString *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:ap];
+    va_end(ap);
+
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], message];
+
+    fprintf(stderr, "%s", line.UTF8String);
+    if (workDir.length == 0) return;
+
+    NSString *path = [workDir stringByAppendingPathComponent:@"jvm-launch.log"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        [fm createFileAtPath:path contents:nil attributes:nil];
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!handle) return;
+    @try {
+        [handle seekToEndOfFile];
+        [handle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [handle closeFile];
+    } @catch (__unused NSException *e) {
+    }
+}
+
+// Cleans user supplied extra JVM args and decides the single GC selector to use.
+// - Heap flags are stripped (structured JESSI memory settings win).
+// - GC selectors are stripped from the extra list and re-added at most once.
+// - Returns nil on a conflict (the caller must abort the launch).
+static NSArray<NSString *> *jessi_prepare_jvm_extra_args(NSArray<NSString *> *extra,
+                                                        NSString *gcMode,
+                                                        NSString *workDir,
+                                                        NSString **gcArgOut,
+                                                        NSString **errorOut) {
+    if (gcArgOut) *gcArgOut = nil;
+    if (errorOut) *errorOut = nil;
+
+    NSMutableArray<NSString *> *sanitized = [NSMutableArray array];
+    NSMutableArray<NSString *> *userGcArgs = [NSMutableArray array];
+
+    for (NSString *arg in extra) {
+        if ([arg hasPrefix:@"-Xms"] || [arg hasPrefix:@"-Xmx"]) {
+            jessi_jvm_launch_log(workDir, @"Ignored duplicate custom heap argument: %@", arg);
+            continue;
+        }
+        if (jessi_arg_is_gc_selector(arg)) {
+            [userGcArgs addObject:arg];
+            continue;
+        }
+        [sanitized addObject:arg];
+    }
+
+    NSString *required = nil;
+    if ([gcMode isEqualToString:@"serial"]) {
+        required = @"-XX:+UseSerialGC";
+    } else if ([gcMode isEqualToString:@"g1"]) {
+        required = @"-XX:+UseG1GC";
+    }
+
+    if (userGcArgs.count > 1) {
+        if (errorOut) {
+            *errorOut = [NSString stringWithFormat:@"Conflicting garbage collectors in custom JVM arguments:\n%@",
+                         [userGcArgs componentsJoinedByString:@"\n"]];
+        }
+        return nil;
+    }
+
+    NSString *userGc = userGcArgs.firstObject;
+    if (required.length > 0) {
+        if (userGc.length > 0 && ![userGc isEqualToString:required]) {
+            if (errorOut) {
+                *errorOut = [NSString stringWithFormat:@"Conflicting garbage collectors:\nConfigured GC: %@\nCustom JVM argument: %@",
+                             [gcMode uppercaseString], userGc];
+            }
+            return nil;
+        }
+        if (gcArgOut) *gcArgOut = required;
+    } else {
+        // Auto: only honor a GC explicitly requested by the user.
+        if (gcArgOut) *gcArgOut = userGc;
+    }
+
+    return sanitized;
+}
+
+static void jessi_log_effective_jvm_args(NSString *workDir,
+                                         NSString *gcMode,
+                                         NSInteger heapMB,
+                                         NSInteger initialHeapMB,
+                                         NSArray<NSString *> *args) {
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"=== Effective JVM Configuration ===\n"];
+    [out appendFormat:@"GC Mode: %@\n", [gcMode uppercaseString] ?: @"AUTO"];
+    [out appendFormat:@"Heap Initial: %ldM\n", (long)initialHeapMB];
+    [out appendFormat:@"Heap Max: %ldM\n", (long)heapMB];
+    [out appendString:@"Arguments:\n"];
+    for (NSString *arg in args) {
+        [out appendFormat:@"%@\n", arg];
+    }
+    [out appendString:@"===================================\n"];
+    jessi_jvm_launch_log(workDir, "%@", out);
+}
+
 static NSString *bundleJavaHomeForVersion(NSString *javaVersion) {
     if (jessi_is_running_on_macos()) {
         NSString *requested = javaVersion.length ? javaVersion : @"21";
@@ -1660,20 +1821,34 @@ int jessi_server_main(int argc, char *argv[]) {
                 }
                 NSArray<NSString *> *expandedExtra = jessi_expand_argfile_entries(extra, workingDir);
                 extra = [expandedExtra mutableCopy] ?: [NSMutableArray array];
+
+                NSString *gcMode = jessi_gc_mode_for_workdir(workingDir);
+                NSString *gcArg = nil;
+                NSString *gcError = nil;
+                NSArray<NSString *> *preparedExtra = jessi_prepare_jvm_extra_args(extra, gcMode, workingDir, &gcArg, &gcError);
+                if (!preparedExtra) {
+                    jessi_jvm_launch_log(workingDir, @"JVM launch aborted: %@", gcError ?: @"unknown GC configuration error");
+                    fprintf(stderr, "%s\n", (gcError ?: @"unknown GC configuration error").UTF8String);
+                    return 252;
+                }
+                extra = [preparedExtra mutableCopy] ?: [NSMutableArray array];
+
                 BOOL userSetPaperIgnoreJavaVersion = jessi_args_contain_prefix(extra, @"-DPaper.IgnoreJavaVersion");
 
                 NSMutableArray<NSString *> *args = [NSMutableArray array];
                 [args addObject:javaPath];
                 [args addObject:xmx];
                 [args addObject:xms];
-                [args addObject:@"-XX:+UseSerialGC"];
+                if (gcArg.length > 0) [args addObject:gcArg];
                 if (flagNettyNoNative) [args addObject:@"-Dio.netty.transport.noNative=true"];
                 if (flagJnaNoSys) {
                     [args addObject:@"-Djna.nosys=true"];
                     [args addObject:@"-Djna.nounpack=true"];
                 }
                 if (isPaperServer && !userSetPaperIgnoreJavaVersion) [args addObject:@"-DPaper.IgnoreJavaVersion=true"];
-                [args addObject:@"-XX:MaxGCPauseMillis=50"];
+                if ([gcMode isEqualToString:@"g1"] && ![jessi_args_contain_prefix(extra, @"-XX:MaxGCPauseMillis=")]) {
+                    [args addObject:@"-XX:MaxGCPauseMillis=50"];
+                }
                 [args addObject:userDirArg];
                 [args addObject:userHomeArg];
                 [args addObject:javaHomeArg];
@@ -1692,6 +1867,7 @@ int jessi_server_main(int argc, char *argv[]) {
                     [args addObject:@"nogui"];
                 }
 
+                jessi_log_effective_jvm_args(workingDir, gcMode, heapMB, initialHeapMB, args);
                 return jessi_spawn_external_java_args(args);
             }
 
@@ -1823,11 +1999,7 @@ int jessi_server_main(int argc, char *argv[]) {
             if (isJava17Plus && !jessi_has_extended_va_entitlement()) {
                 jargv[idx++] = "-XX:-UseCompressedClassPointers";
             }
-            
-            jargv[idx++] = "-XX:+UseSerialGC";
 
-            
-            
             NSString *launchArgsPath = [workingDir stringByAppendingPathComponent:@"jessi-launch-args.txt"]; 
             NSMutableArray<NSString *> *extra = [[NSFileManager defaultManager] fileExistsAtPath:launchArgsPath] ? [readArgsFile(launchArgsPath) mutableCopy] : [NSMutableArray array];
             NSString *savedArgs = [JessiSettings shared].launchArguments ?: @"";
@@ -1841,6 +2013,20 @@ int jessi_server_main(int argc, char *argv[]) {
             NSMutableArray<NSString *> *filteredExtra = [[jessi_filter_extra_jvm_args(extra, ios26OrLater, isJava17Plus) mutableCopy] mutableCopy];
             if (filteredExtra) {
                 extra = filteredExtra;
+            }
+
+            NSString *gcMode = jessi_gc_mode_for_workdir(workingDir);
+            NSString *gcArg = nil;
+            NSString *gcError = nil;
+            NSArray<NSString *> *preparedExtra = jessi_prepare_jvm_extra_args(extra, gcMode, workingDir, &gcArg, &gcError);
+            if (!preparedExtra) {
+                jessi_jvm_launch_log(workingDir, @"JVM launch aborted: %@", gcError ?: @"unknown GC configuration error");
+                fprintf(stderr, "%s\n", (gcError ?: @"unknown GC configuration error").UTF8String);
+                return 252;
+            }
+            extra = [preparedExtra mutableCopy] ?: [NSMutableArray array];
+            if (gcArg.length > 0) {
+                jargv[idx++] = gcArg.UTF8String;
             }
 
             BOOL userSetCodeCache = jessi_args_contain_prefix(extra, @"-XX:ReservedCodeCacheSize=");
@@ -1865,7 +2051,9 @@ int jessi_server_main(int argc, char *argv[]) {
             if (isPaperServer && !userSetPaperIgnoreJavaVersion) {
                 jargv[idx++] = "-DPaper.IgnoreJavaVersion=true";
             }
-            jargv[idx++] = "-XX:MaxGCPauseMillis=50";
+            if ([gcMode isEqualToString:@"g1"] && ![jessi_args_contain_prefix(extra, @"-XX:MaxGCPauseMillis=")]) {
+                jargv[idx++] = "-XX:MaxGCPauseMillis=50";
+            }
             jargv[idx++] = userDirArg.UTF8String;
             jargv[idx++] = userHomeArg.UTF8String;
             jargv[idx++] = javaHomeArg.UTF8String;
@@ -1895,6 +2083,12 @@ int jessi_server_main(int argc, char *argv[]) {
             }
 
             
+            NSMutableArray<NSString *> *effectiveArgs = [NSMutableArray arrayWithCapacity:(NSUInteger)jargc];
+            for (int ai = 0; ai < jargc; ai++) {
+                if (jargv[ai]) [effectiveArgs addObject:[NSString stringWithUTF8String:jargv[ai]]];
+            }
+            jessi_log_effective_jvm_args(workingDir, gcMode, heapMB, initialHeapMB, effectiveArgs);
+
             signal(SIGSEGV, SIG_DFL);
             signal(SIGPIPE, SIG_DFL);
             signal(SIGBUS, SIG_DFL);
@@ -1920,6 +2114,10 @@ int jessi_server_main(int argc, char *argv[]) {
             JESSI_TXM_LOG("[JESSI] Invoking JLI_Launch (server)\n");
             (void)jessi_run_with_hw_breakpoints(jessi_jli_launch_trampoline, &launchCtx);
             JESSI_TXM_LOG("[JESSI] JLI_Launch returned %d\n", (int)launchCtx.result);
+            if ((int)launchCtx.result != 0) {
+                jessi_jvm_launch_log(workingDir, @"JLI_Launch failed\nResult: %d\nRequested GC: %@",
+                                     (int)launchCtx.result, [gcMode uppercaseString]);
+            }
             jessi_free_argv(ownedJargv, jargc);
             int exitCode = (int)launchCtx.result;
             return exitCode;
@@ -2044,7 +2242,6 @@ int jessi_tool_main(int argc, char *argv[]) {
                 [args addObject:javaPath];
                 [args addObject:xmx];
                 [args addObject:xms];
-                [args addObject:@"-XX:+UseSerialGC"];
                 if (flagNettyNoNative) [args addObject:@"-Dio.netty.transport.noNative=true"];
                 if (flagJnaNoSys) {
                     [args addObject:@"-Djna.nosys=true"];
@@ -2160,8 +2357,6 @@ int jessi_tool_main(int argc, char *argv[]) {
             if (isJava17Plus && !jessi_has_extended_va_entitlement()) {
                 jargv[idx++] = "-XX:-UseCompressedClassPointers";
             }
-            jargv[idx++] = "-XX:+UseSerialGC";
-
             if (flagNettyNoNative) {
                 jargv[idx++] = "-Dio.netty.transport.noNative=true";
             }
