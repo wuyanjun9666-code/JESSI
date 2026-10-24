@@ -51,14 +51,26 @@
 
 ## 本次修改点
 
-1. 新增 `jessi_gc_mode_for_workdir()`：读取 `jessi.gcMode`（NSUserDefaults）或 `<workdir>/jessi-gc-mode.txt`，取值为 `auto|serial|g1`，默认 `auto`。
+1. 新增 `jessi_gc_mode_for_workdir(workDir, &source)`：
+   - 优先级：`<workdir>/jessi-gc-mode.txt` > `NSUserDefaults jessi.gcMode` > `serial`
+   - 只接受 `auto|serial|g1`；非法值记录 `Invalid GC mode` 并回退 `Serial`
+   - 同时输出 `GC Mode Source`（server-file / user-defaults / default）
 2. 新增 `jessi_prepare_jvm_extra_args()`：
    - 剥离 extra 中的 `-Xms*` / `-Xmx*`（结构化内存设置优先），写日志 `Ignored duplicate custom heap argument`
    - 收集 extra 中的 GC selector，最多保留一个
    - 结构化 GC 与 extra GC 冲突时返回错误，不启动 JVM
-3. Server 两条路径都改为：先准备 extra/GC，再写入唯一 GC 参数
+3. Server 两条路径（macOS `args` 与 iOS `jargv`）都调用同一组 helper
 4. `MaxGCPauseMillis=50` 仅在 GC Mode = G1 时添加，且 extra 未自带
-5. Tool 两条路径移除硬编码 `UseSerialGC`（不指定 GC，交给 JVM 默认）
-6. 启动前写入 `jvm-launch.log`（工作目录）与 stderr：Effective JVM Configuration
-7. `JLI_Launch` 返回非 0 时记录 result、Requested GC、时间戳
-8. 不做自动 fallback，不做进程内二次创建 JVM
+5. Tool 两条路径**保持上游 SerialGC**，不进入 GC Mode 逻辑
+6. 启动前写入 `jvm-launch.log` 与 stderr：Effective JVM Configuration
+7. `jvm-launch.log` 对 `-D*password/token/secret/auth/...` 做脱敏
+8. 堆参数启动前校验：Xms/Xmx > 0 且 Xms <= Xmx，否则不调用 JVM
+9. `JLI_Launch` 返回非 0 时记录 result、Requested GC、时间戳
+10. 不做自动 fallback，不做进程内二次创建 JVM
+11. Code Cache 默认值保持上游逻辑不变（iOS ≤18 → 64M；iOS 26+ TXM workaround → 32M）
+
+## Code Cache 说明
+
+`jessi_device_requires_txm_workaround()` 为真且 iOS 26+ 时才使用 32M；
+iOS ≤18 使用 64M；其余情况不显式添加。当前 iPadOS 27 / M1 属于 iOS 26+ 分支，
+若该设备被判定需要 TXM workaround，则日志中会看到 32M。

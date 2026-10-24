@@ -112,7 +112,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: JESSI-jvm-gc-test-ipa
-          path: ${{ env.IPA_PATH }}
+          path: dist/JESSI.ipa
           if-no-files-found: error
 
       - name: generate changelog
