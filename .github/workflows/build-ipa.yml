@@ -99,11 +99,21 @@ jobs:
             ldid -S"$JESSI_LDID_ENTITLEMENTS" "$DEST_APP/$APP_NAME"
           fi
 
+          # Distinct display name for the test build (bundle id unchanged).
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 'JESSI JVM Test'" "$DEST_APP/Info.plist" || true
+
           mkdir -p "$DIST_DIR"
           cd "$DIST_DIR"
           /usr/bin/zip -qr "$IPA_PATH" Payload
 
           echo "IPA_PATH=$IPA_PATH" >> $GITHUB_ENV
+
+      - name: upload ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JESSI-jvm-gc-test-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
 
       - name: generate changelog
         id: changelog
